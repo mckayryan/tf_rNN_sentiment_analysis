@@ -7,6 +7,8 @@ import tarfile
 import re
 import collections
 import string
+import random
+from sklearn.model_selection import train_test_split
 from operator import itemgetter
 from pprint import pprint as pp
 
@@ -15,6 +17,7 @@ batch_size = 50
 class Config(object):
     embedding_size = 50
     dictionary_size = 50000
+    max_sample = 25000
     record_length = 40
     embeddings_file = "glove.6B.50d.txt"
     reviews_file = "reviews.tar.gz"
@@ -24,13 +27,21 @@ class Config(object):
     dropout_keep_prob = 1
     cell_size = 128
     learning_rate = 0.001
-
+    classes = 2
 
 
 def printd(print_string, **kwargs):
     c = Config()
     if c.debug > 0:
         print(print_string.format(**kwargs))
+
+def split_data(X, split):
+    config = Config()
+    total_pop = config.max_sample
+    printd('Splitting data train {trs} / test {ts} from {records} records', trs=1-split, ts=split, records=total_pop)
+    y = [ [1,0] if i < total_pop / 2 else [0,1] for i in range(total_pop)]
+    Xtr, Xt, Ytr, Yt = train_test_split(X, y, test_size=split, random_state=42)
+    return Xtr, Ytr, Xt, Yt
 
 # Read the data into a list of strings.
 def extract_data(filename, path):
@@ -56,7 +67,7 @@ def read_data(path):
             data.append(no_punct.split())
     printd("Read data {p} successfully with length {ld}",p=path,ld=len(data))
     for i in range(len(data[:5])):
-        print(len(data[i]),data[i][:10])
+        printd(len(data[i]),data[i][:10])
     return data
 
 def count_words(data):
@@ -233,7 +244,7 @@ def load_glove_embeddings():
 
     return np.array(embeddings, dtype=float), word_index_dict
 
-def define_graph(glove_embeddings_arr):
+def define_graph(glove_embeddings_arr, batch_size):
     """
     Define the tensorflow graph that forms your model. You must use at least
     one recurrent unit. The input placeholder should be of size [batch_size,
@@ -253,43 +264,71 @@ def define_graph(glove_embeddings_arr):
     dictionary_size     = config.dictionary_size
     cell_size           = config.cell_size
     learning_rate       = config.learning_rate
-    dropout_rate        = config.dropout_keep_prob
+    dropout_keep_rate   = config.dropout_keep_prob
+    num_classes         = config.classes
+
 
     with tf.device("/gpu:0"):
         with tf.name_scope("data"):
             # input
-            X = tf.placeholder([None,None], dtype=tf.uint16, name="input_data")
-            if dropout_rate < 1:
-                X = tf.nn.dropout(X, dropout_rate)
-            # label
-            Y = tf.placeholder(batch_size, dtype=tf.uint16, name="labels")
+            X = tf.placeholder(tf.int32, [batch_size,input_size], name="input_data")
+            printd('input_data\t(X) \t{shape}\tsuccessfully assigned',shape=X.shape)
+
+            # input dropout
+            if dropout_keep_rate < 1:
+                X = tf.nn.dropout(X, dropout_keep_rate)
+                printd('Dropout applied to input_data at keep rate {rate}',rate=dropout_keep_rate)
+
+            # labels
+            labels = tf.placeholder(tf.int32, [batch_size,num_classes], name="labels")
+            printd('labels\t\t\t{shape}\t\tsuccessfully assigned',shape=labels.shape)
 
         with tf.name_scope("embed"):
-            embedding = tf.get_variable(glove_embeddings_arr.shape, tf.constant_initializer(glove_embeddings_arr),\
-                            dtype=tf.float32, name="embedding", trainable=False)
-            X_ = tf.nn.embedding_lookup(embedding, X)
+            # set word embeddings
+            embedding = tf.get_variable("embedding", glove_embeddings_arr.shape, tf.float32,\
+                            tf.constant_initializer(glove_embeddings_arr), trainable=False)
+            printd('embedding tensor \t{shape}\tsuccessfully assigned',shape=embedding.shape)
+            X_ = tf.nn.embedding_lookup(embedding, X, name="input_embed")
+            printd('input_embed \t(X_)\t{shape}\tsuccessfully assigned',shape=X_.shape)
 
-        cell = tf.nn.rnn_cell.GRUCell(cell_size)
-        if hidden_units_size > 1:
-            cell = tf.nn.rnn_cell.MultiRNNCell([cell]*hidden_units_size)
+        with tf.name_scope("cell"):
+            cell = tf.nn.rnn_cell.GRUCell(cell_size)
+            drop_cell = tf.contrib.rnn.DropoutWrapper(cell, dropout_keep_rate)
+            if hidden_units_size > 1:
+                cell = tf.nn.rnn_cell.MultiRNNCell([drop_cell]*hidden_units_size)
+            printd('{layer} GRU cell layer/s \t{out} outputs | {states} states | {drop} dropout keep rate',\
+                        layer=hidden_units_size, out=cell.output_size, states=cell.state_size, drop=dropout_keep_rate)
 
         with tf.name_scope("output"):
-            init_state = cell.zero_state(batch_size, dtype=tf.float32)
-            Ycell, final_state = tf.dynamic_rnn(cell, X_, initial_state=initial_state)
+            init_state = cell.zero_state(batch_size, tf.float32)
+            Ycell, final_state = tf.nn.dynamic_rnn(cell, X_, initial_state=init_state)
+            printd('Ycell \t\t\t{shape}\tsuccessfully assigned as {type}',shape=Ycell.shape, type=Ycell.dtype)
 
-            Yflat = tf.reshape(Ycell, cell_size)
-            Ylogits = tf.contrib.layers.fully_connected(Yflat,1, activation_fn=None)
+            Yflat = tf.reshape(Ycell[:,-1], [-1, cell_size])
+            Ylogits = tf.contrib.layers.fully_connected(Yflat, 2, activation_fn=None)
+            printd('Ylogits -> calculated \t{shape} as {type}', shape=Ylogits.shape, type=Ylogits.dtype)
 
-            Y_ = tf.nn.sigmoid(Ylogits, name="predictions")
-
-            accuracy = tf.reduce_mean(tf.cast(tf.equal(Y_, Y), tf.float32))
+            Y_ = tf.argmax(Ylogits, 1)
+            printd('Y_ -> prediction made \t{ps} as {pt}', ps=Y_.shape, pt=Y_.dtype)
+            # printd('prediction examples {pe}', pe=Y_[:5])
 
         with tf.name_scope("loss"):
-            loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=Ylogits, labels=Y)
+            loss = tf.nn.softmax_cross_entropy_with_logits(logits=Ylogits, labels=labels, name="loss")
+            printd('loss\t\t\t{shape}', shape=loss.shape)
+
             optimizer = tf.train.AdamOptimizer(learning_rate).minimize(loss)
+            loss = tf.reduce_mean(loss)
+            printd('optimizer\t\t{shape}', shape=optimizer)
 
+    with tf.device('/cpu:0'):
+        Y = tf.argmax(labels, 1)
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(Y,Y_), tf.float32), name="accuracy")
+        printd('accuracy\t\t{detail}', detail=accuracy)
 
-    return X, Y, dropout_rate, optimizer, accuracy, loss
+        printd('Accuracy, loss & optimizer set')
+        printd('Graph definition complete\n\n')
+
+    return X, labels, dropout_keep_rate, optimizer, accuracy, loss
 
 
 # embeddings, index = load_glove_embeddings()
