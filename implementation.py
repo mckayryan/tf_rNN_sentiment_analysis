@@ -13,6 +13,7 @@ from operator import itemgetter
 from pprint import pprint as pp
 
 batch_size = 50
+hidden_layers = 3
 
 class Config(object):
     embedding_size = 50
@@ -23,7 +24,7 @@ class Config(object):
     reviews_file = "reviews.tar.gz"
     reviews_path = os.path.join(os.path.dirname(__file__), 'review_data/')
     debug = 1
-    hidden_units_size = 1
+    hidden_layers = 2
     dropout_keep_prob = 1
     cell_size = 128
     learning_rate = 0.001
@@ -41,6 +42,12 @@ def split_data(X, split):
     printd('Splitting data train {trs} / test {ts} from {records} records', trs=1-split, ts=split, records=total_pop)
     y = [ [1,0] if i < total_pop / 2 else [0,1] for i in range(total_pop)]
     Xtr, Xt, Ytr, Yt = train_test_split(X, y, test_size=split, random_state=42)
+    Xtr = np.array(Xtr)
+    Xt = np.array(Xt)
+    Ytr = np.array(Ytr)
+    Yt = np.array(Yt)
+    printd('Datasets\nXtrain {xtr}\tYtrain {ytr}\nXtest  {xt}\tYtest  {yt}', \
+                xtr=Xtr.shape, ytr=Ytr.shape, xt=Xt.shape, yt=Yt.shape)
     return Xtr, Ytr, Xt, Yt
 
 # Read the data into a list of strings.
@@ -260,24 +267,22 @@ def define_graph(glove_embeddings_arr, batch_size):
     config              = Config()
     input_size          = config.record_length
     embedding_size      = config.embedding_size
-    hidden_units_size   = config.hidden_units_size
+    hidden_layers       = config.hidden_layers
     dictionary_size     = config.dictionary_size
     cell_size           = config.cell_size
     learning_rate       = config.learning_rate
-    dropout_keep_rate   = config.dropout_keep_prob
+#    dropout_keep   = config.dropout_keep_prob
     num_classes         = config.classes
 
+    with tf.device("/cpu:0"):
+        # input dropout
+        dropout_keep = tf.placeholder_with_default(1.0, shape=(), name="dropout_keep_prob")
 
     with tf.device("/gpu:0"):
         with tf.name_scope("data"):
             # input
             X = tf.placeholder(tf.int32, [batch_size,input_size], name="input_data")
             printd('input_data\t(X) \t{shape}\tsuccessfully assigned',shape=X.shape)
-
-            # input dropout
-            if dropout_keep_rate < 1:
-                X = tf.nn.dropout(X, dropout_keep_rate)
-                printd('Dropout applied to input_data at keep rate {rate}',rate=dropout_keep_rate)
 
             # labels
             labels = tf.placeholder(tf.int32, [batch_size,num_classes], name="labels")
@@ -292,16 +297,21 @@ def define_graph(glove_embeddings_arr, batch_size):
             printd('input_embed \t(X_)\t{shape}\tsuccessfully assigned',shape=X_.shape)
 
         with tf.name_scope("cell"):
-            cell = tf.nn.rnn_cell.GRUCell(cell_size)
-            drop_cell = tf.contrib.rnn.DropoutWrapper(cell, dropout_keep_rate)
-            if hidden_units_size > 1:
-                cell = tf.nn.rnn_cell.MultiRNNCell([drop_cell]*hidden_units_size)
+            cells = [ tf.nn.rnn_cell.GRUCell(cell_size) for _ in range(hidden_layers) ]
+            dropcells = [ tf.nn.rnn_cell.DropoutWrapper(cell, dropout_keep) for cell in cells ]
+            printd('Dropout applied to {ncells} cell/s at keep rate {rate}', \
+                    ncells=hidden_layers, rate=dropout_keep)
+
+            multicell = tf.nn.rnn_cell.MultiRNNCell(dropcells)
+            multicell = tf.nn.rnn_cell.DropoutWrapper(multicell, dropout_keep)
             printd('{layer} GRU cell layer/s \t{out} outputs | {states} states | {drop} dropout keep rate',\
-                        layer=hidden_units_size, out=cell.output_size, states=cell.state_size, drop=dropout_keep_rate)
+                        layer=hidden_layers, out=multicell.output_size, \
+                        states=multicell.state_size, drop=dropout_keep)
 
         with tf.name_scope("output"):
-            init_state = cell.zero_state(batch_size, tf.float32)
-            Ycell, final_state = tf.nn.dynamic_rnn(cell, X_, initial_state=init_state)
+            init_state = multicell.zero_state(batch_size, tf.float32)
+
+            Ycell, final_state = tf.nn.dynamic_rnn(multicell, X_, initial_state=init_state)
             printd('Ycell \t\t\t{shape}\tsuccessfully assigned as {type}',shape=Ycell.shape, type=Ycell.dtype)
 
             Yflat = tf.reshape(Ycell[:,-1], [-1, cell_size])
@@ -323,12 +333,12 @@ def define_graph(glove_embeddings_arr, batch_size):
     with tf.device('/cpu:0'):
         Y = tf.argmax(labels, 1)
         accuracy = tf.reduce_mean(tf.cast(tf.equal(Y,Y_), tf.float32), name="accuracy")
-        printd('accuracy\t\t{detail}', detail=accuracy)
+        printd('accuracy\t{detail}\n', detail=accuracy)
 
         printd('Accuracy, loss & optimizer set')
         printd('Graph definition complete\n\n')
 
-    return X, labels, dropout_keep_rate, optimizer, accuracy, loss
+    return X, labels, dropout_keep, optimizer, accuracy, loss
 
 
 # embeddings, index = load_glove_embeddings()
